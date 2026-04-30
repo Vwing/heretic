@@ -583,6 +583,12 @@ def run():
 
             print(f"[green]Ok[/] ([bold]{performance:.0f}[/] tokens/s)")
 
+            if best_performance > 0 and performance < best_performance:
+                print(
+                    "* Stopping early because performance dropped below the best result"
+                )
+                break
+
             if performance > best_performance:
                 best_batch_size = batch_size
                 best_performance = performance
