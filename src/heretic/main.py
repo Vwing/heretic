@@ -55,7 +55,7 @@ from rich.traceback import install
 from .analyzer import Analyzer
 from .config import QuantizationMethod, RowNormalization, Settings
 from .evaluator import Evaluator
-from .model import AbliterationParameters, ARAParameters, Model, get_model_class
+from .model import AbliterationParameters, ARAParameters, Model, ModuleIO, get_model_class
 from .utils import (
     empty_cache,
     format_duration,
@@ -231,6 +231,114 @@ def prepare_lora_adapter_for_export(model: Model, settings: Settings) -> None:
     # so generic PEFT tooling can identify the required base model.
     for peft_config in getattr(model.model, "peft_config", {}).values():
         peft_config.base_model_name_or_path = settings.model
+
+
+def parse_rank_list(value: str) -> list[int]:
+    ranks = []
+
+    for item in value.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        rank = int(item)
+        if rank < 1:
+            raise ValueError("Ranks must be positive integers.")
+        ranks.append(rank)
+
+    if not ranks:
+        raise ValueError("At least one rank is required.")
+
+    return ranks
+
+
+def benchmark_ara_lora_approximations(
+    settings: Settings,
+    model: Model,
+    evaluator: Evaluator,
+    good_module_io: ModuleIO,
+    bad_module_io: ModuleIO,
+    ara_parameters: ARAParameters,
+) -> None:
+    print()
+    rank_text = prompt_text(
+        "LoRA ranks to benchmark (comma-separated):",
+        default=", ".join(str(rank) for rank in settings.ara_lora_benchmark_ranks),
+    )
+    if rank_text is None or rank_text == "":
+        return
+
+    try:
+        ranks = parse_rank_list(rank_text)
+    except ValueError as error:
+        print(f"[red]{error}[/]")
+        return
+
+    print()
+    print("* Restoring exact ARA model...")
+    model.reset_model()
+    original_weights = model.get_ara_weight_snapshot(ara_parameters)
+    model.ara_abliterate(good_module_io, bad_module_io, ara_parameters)
+    deltas = model.get_ara_weight_deltas(original_weights)
+
+    print("* Evaluating exact ARA...")
+    _, exact_metric, exact_refusals = evaluator.get_score()
+
+    rows = [
+        {
+            "rank": "Exact ARA",
+            "metric": exact_metric,
+            "refusals": exact_refusals,
+            "delta_metric": 0.0,
+            "delta_refusals": 0,
+            "relative_error": 0.0,
+        }
+    ]
+
+    for rank in ranks:
+        print()
+        print(f"* Evaluating rank-{rank} ARA LoRA approximation...")
+        model.reset_model()
+        adapter_metadata = model.apply_ara_lora_adapter(original_weights, deltas, rank)
+        _, metric, refusals = evaluator.get_score()
+        rows.append(
+            {
+                "rank": str(rank),
+                "metric": metric,
+                "refusals": refusals,
+                "delta_metric": metric - exact_metric,
+                "delta_refusals": refusals - exact_refusals,
+                "relative_error": adapter_metadata["relative_frobenius_error"],
+            }
+        )
+
+    metric_name = "PIQA acc_norm" if settings.use_piqa else "KL divergence"
+    metric_sign = -1 if settings.use_piqa else 1
+
+    table = Table(title="ARA LoRA Approximation Benchmark")
+    table.add_column("Variant")
+    table.add_column(metric_name, justify="right")
+    table.add_column(f"Delta {metric_name}", justify="right")
+    table.add_column("Refusals", justify="right")
+    table.add_column("Delta Refusals", justify="right")
+    table.add_column("Relative SVD Error", justify="right")
+
+    for row in rows:
+        table.add_row(
+            str(row["rank"]),
+            f"{metric_sign * row['metric']:.4f}",
+            f"{metric_sign * row['delta_metric']:+.4f}",
+            f"{row['refusals']}/{len(evaluator.bad_prompts)}",
+            f"{row['delta_refusals']:+d}",
+            f"{row['relative_error']:.4f}",
+        )
+
+    print()
+    print(table)
+
+    print()
+    print("* Restoring exact ARA model...")
+    model.reset_model()
+    model.ara_abliterate(good_module_io, bad_module_io, ara_parameters)
 
 
 def run():
@@ -928,15 +1036,19 @@ def run():
 
             while True:
                 print()
+                actions = [
+                    "Save the model to a local folder",
+                    "Upload the model to Hugging Face",
+                    "Chat with the model",
+                    "Benchmark the model",
+                ]
+                if settings.use_ara:
+                    actions.append("Benchmark ARA LoRA approximation ranks")
+                actions.append("Return to the trial selection menu")
+
                 action = prompt_select(
                     "What do you want to do with the decensored model?",
-                    [
-                        "Save the model to a local folder",
-                        "Upload the model to Hugging Face",
-                        "Chat with the model",
-                        "Benchmark the model",
-                        "Return to the trial selection menu",
-                    ],
+                    actions,
                 )
 
                 if action is None or action == "Return to the trial selection menu":
@@ -1277,6 +1389,19 @@ def run():
                             # if there actually are some.
                             if table.rows:
                                 print(table)
+
+                        case "Benchmark ARA LoRA approximation ranks":
+                            if not settings.use_ara:
+                                continue
+
+                            benchmark_ara_lora_approximations(
+                                settings,
+                                model,
+                                evaluator,
+                                good_module_io,
+                                bad_module_io,
+                                ara_parameters,
+                            )
 
                 except Exception as error:
                     print(f"[red]Error: {error}[/]")

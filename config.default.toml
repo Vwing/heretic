@@ -84,6 +84,10 @@ full_normalization_lora_rank = 3
 # larger adapters and may slow down inference.
 ara_lora_rank = 16
 
+# LoRA ranks to benchmark against the exact ARA result when using the
+# ARA LoRA approximation benchmark action.
+ara_lora_benchmark_ranks = [4, 8, 16, 32, 64]
+
 # The symmetric winsorization to apply to the per-prompt, per-layer residual vectors,
 # expressed as the quantile to clamp to (between 0 and 1). Disabled by default.
 # This can tame so-called "massive activations" that occur in some models.

@@ -250,6 +250,14 @@ class Settings(BaseSettings):
         ),
     )
 
+    ara_lora_benchmark_ranks: list[int] = Field(
+        default=[4, 8, 16, 32, 64],
+        description=(
+            "LoRA ranks to benchmark against the exact ARA result when using the "
+            "ARA LoRA approximation benchmark action."
+        ),
+    )
+
     winsorization_quantile: float = Field(
         default=1.0,
         description=(

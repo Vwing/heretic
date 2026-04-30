@@ -114,6 +114,12 @@ include PEFT's standard adapter files plus `heretic_adapter_config.json`, which
 records the base model, Heretic version, trial parameters, settings, and any
 ARA approximation metadata used to generate the adapter.
 
+For ARA runs, the trial action menu also includes a benchmark for LoRA
+approximation ranks. It evaluates the exact ARA edit, then evaluates each rank
+listed in `ara_lora_benchmark_ranks` (or the ranks entered interactively) against
+the same refusal/KL or PIQA metrics, reporting metric deltas and SVD
+approximation error.
+
 
 ## Research features
 

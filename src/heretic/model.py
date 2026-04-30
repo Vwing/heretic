@@ -697,16 +697,19 @@ class Model:
         original_weights: dict[tuple[int, str, int], Tensor],
         rank: int,
     ) -> dict[str, float | int]:
+        return self.apply_ara_lora_adapter(
+            original_weights,
+            self.get_ara_weight_deltas(original_weights),
+            rank,
+        )
+
+    def get_ara_weight_deltas(
+        self,
+        original_weights: dict[tuple[int, str, int], Tensor],
+    ) -> dict[tuple[int, str, int], Tensor]:
         assert isinstance(self.model, PreTrainedModel)
 
-        if rank < 1:
-            raise ValueError("ARA LoRA export rank must be at least 1.")
-
         deltas = {}
-        total_delta_norm_squared = 0.0
-        total_error_norm_squared = 0.0
-        effective_rank_sum = 0
-
         for key, original_matrix in original_weights.items():
             layer_index, component, module_index = key
             module = self.get_layer_modules(layer_index)[component][module_index]
@@ -715,10 +718,31 @@ class Model:
             delta = edited_matrix - original_matrix.to(edited_matrix.device)
             deltas[key] = delta.cpu()
 
+        return deltas
+
+    def apply_ara_lora_adapter(
+        self,
+        original_weights: dict[tuple[int, str, int], Tensor],
+        deltas: dict[tuple[int, str, int], Tensor],
+        rank: int,
+    ) -> dict[str, float | int]:
+        assert isinstance(self.model, PreTrainedModel)
+
+        if rank < 1:
+            raise ValueError("ARA LoRA export rank must be at least 1.")
+
+        for key, original_matrix in original_weights.items():
+            layer_index, component, module_index = key
+            module = self.get_layer_modules(layer_index)[component][module_index]
+            matrix = cast(Tensor, module.weight)
             with torch.no_grad():
                 matrix.copy_(original_matrix.to(matrix.device, dtype=matrix.dtype))
 
         self._apply_lora(lora_rank=rank)
+
+        total_delta_norm_squared = 0.0
+        total_error_norm_squared = 0.0
+        effective_rank_sum = 0
 
         for key, delta in deltas.items():
             layer_index, component, module_index = key
