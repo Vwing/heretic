@@ -105,12 +105,14 @@ After Heretic has finished decensoring a model, you are given the option to
 save the model, upload it to Hugging Face, chat with it to test how well it works,
 or any combination of those actions.
 
-When using the non-ARA abliteration path (`use_ara = false`), Heretic can also
-export only the generated LoRA adapter instead of a full merged model. Adapter
-exports are small and must be loaded together with the original base model.
-They include PEFT's standard adapter files plus `heretic_adapter_config.json`,
-which records the base model, Heretic version, trial parameters, and settings
-used to generate the adapter.
+Heretic can also export only a LoRA adapter instead of a full merged model.
+Adapter exports are small and must be loaded together with the original base
+model. Non-ARA adapters are the exact LoRA representation used internally. ARA
+adapters are truncated-SVD approximations of the full ARA weight edit; the
+`ara_lora_rank` setting controls the quality/size tradeoff. Adapter exports
+include PEFT's standard adapter files plus `heretic_adapter_config.json`, which
+records the base model, Heretic version, trial parameters, settings, and any
+ARA approximation metadata used to generate the adapter.
 
 
 ## Research features

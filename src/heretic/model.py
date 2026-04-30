@@ -178,7 +178,7 @@ class Model:
         for component, count in all_components.items():
             print(f"  * [bold]{component}[/]: [bold]{count}[/] modules total")
 
-    def _apply_lora(self):
+    def _apply_lora(self, lora_rank: int | None = None):
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PreTrainedModel)
 
@@ -202,12 +202,13 @@ class Model:
 
         target_modules = list(target_modules_set)
 
-        if self.settings.row_normalization != RowNormalization.FULL:
-            # Rank 1 is sufficient for directional ablation without renormalization.
-            lora_rank = 1
-        else:
-            # Row magnitude preservation introduces nonlinear effects.
-            lora_rank = self.settings.full_normalization_lora_rank
+        if lora_rank is None:
+            if self.settings.row_normalization != RowNormalization.FULL:
+                # Rank 1 is sufficient for directional ablation without renormalization.
+                lora_rank = 1
+            else:
+                # Row magnitude preservation introduces nonlinear effects.
+                lora_rank = self.settings.full_normalization_lora_rank
 
         self.peft_config = LoraConfig(
             r=lora_rank,
@@ -225,6 +226,9 @@ class Model:
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
 
         print(f"* LoRA adapters initialized (targets: {', '.join(target_modules)})")
+
+    def has_lora_adapter(self) -> bool:
+        return isinstance(self.model, PeftModel)
 
     def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
         """
@@ -660,13 +664,134 @@ class Model:
 
                     # Convergence usually happens within 2-3 steps, so this is more than enough.
                     for step in range(5):
-                        loss = optimizer.step(closure)
+                        optimizer.step(closure)
                         # print(
-                        #    f"\\[{layer_index}/{component}/{module_index}] Step: {step}, Loss: {loss.item():.6f}"
+                        #    f"\\[{layer_index}/{component}/{module_index}] Step: {step}"
                         # )
 
                     with torch.no_grad():
                         matrix.copy_(get_matrix())
+
+    def get_ara_weight_snapshot(
+        self,
+        parameters: ARAParameters,
+    ) -> dict[tuple[int, str, int], Tensor]:
+        assert isinstance(self.model, PreTrainedModel)
+
+        weights = {}
+        for layer_index in range(
+            parameters.start_layer_index,
+            parameters.end_layer_index,
+        ):
+            for component, modules in self.get_layer_modules(layer_index).items():
+                for module_index, module in enumerate(modules):
+                    matrix = cast(Tensor, module.weight)
+                    weights[(layer_index, component, module_index)] = (
+                        matrix.detach().clone().cpu().to(torch.float32)
+                    )
+
+        return weights
+
+    def convert_ara_to_lora_adapter(
+        self,
+        original_weights: dict[tuple[int, str, int], Tensor],
+        rank: int,
+    ) -> dict[str, float | int]:
+        assert isinstance(self.model, PreTrainedModel)
+
+        if rank < 1:
+            raise ValueError("ARA LoRA export rank must be at least 1.")
+
+        deltas = {}
+        total_delta_norm_squared = 0.0
+        total_error_norm_squared = 0.0
+        effective_rank_sum = 0
+
+        for key, original_matrix in original_weights.items():
+            layer_index, component, module_index = key
+            module = self.get_layer_modules(layer_index)[component][module_index]
+            matrix = cast(Tensor, module.weight)
+            edited_matrix = matrix.detach().to(torch.float32).view(original_matrix.shape)
+            delta = edited_matrix - original_matrix.to(edited_matrix.device)
+            deltas[key] = delta.cpu()
+
+            with torch.no_grad():
+                matrix.copy_(original_matrix.to(matrix.device, dtype=matrix.dtype))
+
+        self._apply_lora(lora_rank=rank)
+
+        for key, delta in deltas.items():
+            layer_index, component, module_index = key
+            module = cast(
+                Linear,
+                self.get_layer_modules(layer_index)[component][module_index],
+            )
+
+            delta = delta.to(torch.float32)
+            matrix_shape = delta.shape
+            delta = delta.view(delta.shape[0], -1)
+            max_rank = min(rank, min(delta.shape))
+
+            if max_rank == 0:
+                continue
+
+            U, S, V = torch.svd_lowrank(
+                delta,
+                q=min(2 * max_rank + 4, min(delta.shape)),
+                niter=6,
+            )
+            U = U[:, :max_rank]
+            S = S[:max_rank]
+            Vh = V[:, :max_rank].T
+
+            sqrt_S = torch.sqrt(S)
+            fitted_lora_B = U @ torch.diag(sqrt_S)
+            fitted_lora_A = torch.diag(sqrt_S) @ Vh
+
+            lora_B = torch.zeros(
+                delta.shape[0],
+                rank,
+                dtype=fitted_lora_B.dtype,
+                device=fitted_lora_B.device,
+            )
+            lora_A = torch.zeros(
+                rank,
+                delta.shape[1],
+                dtype=fitted_lora_A.dtype,
+                device=fitted_lora_A.device,
+            )
+            lora_B[:, :max_rank] = fitted_lora_B
+            lora_A[:max_rank, :] = fitted_lora_A
+
+            approximation = lora_B @ lora_A
+            error = delta - approximation
+            total_delta_norm_squared += float(torch.sum(delta * delta).item())
+            total_error_norm_squared += float(torch.sum(error * error).item())
+            effective_rank_sum += max_rank
+
+            weight_A = cast(Tensor, module.lora_A["default"].weight)
+            weight_B = cast(Tensor, module.lora_B["default"].weight)
+
+            # PEFT stores LoRA weights flattened for linear layers.
+            assert weight_A.shape == lora_A.shape
+            assert weight_B.shape == lora_B.shape
+            assert matrix_shape == cast(Tensor, module.base_layer.weight).shape
+
+            weight_A.data = lora_A.to(weight_A.device, dtype=weight_A.dtype)
+            weight_B.data = lora_B.to(weight_B.device, dtype=weight_B.dtype)
+
+        relative_error = (
+            math.sqrt(total_error_norm_squared / total_delta_norm_squared)
+            if total_delta_norm_squared > 0
+            else 0.0
+        )
+
+        return {
+            "rank": rank,
+            "effective_rank_sum": effective_rank_sum,
+            "module_count": len(deltas),
+            "relative_frobenius_error": relative_error,
+        }
 
     def generate(
         self,

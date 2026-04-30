@@ -240,6 +240,16 @@ class Settings(BaseSettings):
         ),
     )
 
+    ara_lora_rank: int = Field(
+        default=16,
+        description=(
+            "The rank of the LoRA adapter to use when exporting an ARA result as an adapter. "
+            "ARA edits are generally full-rank, so adapter export uses a truncated SVD "
+            "approximation. Higher ranks preserve the ARA edit more accurately but produce "
+            "larger adapters and may slow down inference."
+        ),
+    )
+
     winsorization_quantile: float = Field(
         default=1.0,
         description=(
