@@ -204,6 +204,13 @@ class Settings(BaseSettings):
         ),
     )
 
+    use_ara_lora: bool = Field(
+        default=False,
+        description=(
+            "Use LoRA in ARA instead of full-weight editing. Makes it compatible with quantization and removes model reloads."
+        ),
+    )
+
     use_piqa: bool = Field(
         default=False,
         description=(
@@ -243,10 +250,11 @@ class Settings(BaseSettings):
     ara_lora_rank: int = Field(
         default=16,
         description=(
-            "The rank of the LoRA adapter to use when exporting an ARA result as an adapter. "
-            "ARA edits are generally full-rank, so adapter export uses a truncated SVD "
-            "approximation. Higher ranks preserve the ARA edit more accurately but produce "
-            "larger adapters and may slow down inference."
+            "The rank of the LoRA adapter to use for direct ARA LoRA optimization or "
+            "when exporting an exact ARA result as an adapter. Exact ARA edits are "
+            "generally full-rank, so adapter export uses a truncated SVD approximation. "
+            "Higher ranks preserve the ARA edit more accurately but produce larger "
+            "adapters and may slow down inference."
         ),
     )
 
