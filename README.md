@@ -159,17 +159,24 @@ This gives you access to the following functionality:
 
 When run with this flag, Heretic will:
 
-1. Compute residual vectors (hidden states) for the first output token,
+1. Ask whether to plot residuals for the base model before optimization.
+2. Add a menu action that plots residuals for the selected trial after
+   applying that trial's edit, including ARA edits.
+3. Compute residual vectors (hidden states) for the first output token,
    for each transformer layer, for both "harmful" and "harmless" prompts.
-2. Perform a [PaCMAP projection](https://github.com/YingfanWang/PaCMAP)
+4. Perform a [PaCMAP projection](https://github.com/YingfanWang/PaCMAP)
    from residual space to 2D-space.
-3. Left-right align the projections of "harmful"/"harmless" residuals
+5. Left-right align the projections of "harmful"/"harmless" residuals
    by their geometric medians to make projections for consecutive layers
    more similar. Additionally, PaCMAP is initialized with the previous
    layer's projections for each new layer, minimizing disruptive transitions.
-4. Scatter-plot the projections, generating a PNG image for each layer.
-5. Generate an animation showing how residuals transform between layers,
+6. Scatter-plot the projections, generating a PNG image for each layer.
+7. Generate an animation showing how residuals transform between layers,
    as an animated GIF.
+
+Base-model plots are saved under the configured plot path's `base` subdirectory.
+Selected-trial plots are saved under a subdirectory named after the trial
+index, refusal count, and KL divergence, such as `t3-r4-kl0.0724`.
 
 <img width="800" height="600" alt="Plot of residual vectors" src="https://github.com/user-attachments/assets/981aa6ed-5ab9-48f0-9abf-2b1a2c430295" />
 

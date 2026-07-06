@@ -506,7 +506,10 @@ class Settings(BaseSettings):
 
     model_action: str | None = Field(
         default=None,
-        description='Action to take with the decensored model: "save", "upload", or unset to prompt the user.',
+        description=(
+            'Action to take with the decensored model: "save", "upload", '
+            '"chat", "benchmark", "plot_residuals", or unset to prompt the user.'
+        ),
     )
 
     save_directory: str | None = Field(

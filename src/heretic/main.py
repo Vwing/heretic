@@ -723,6 +723,31 @@ def run():
         evaluator.get_score()
         return
 
+    def plot_residuals(plot_path_suffix: str):
+        original_residual_plot_path = settings.residual_plot_path
+        settings.residual_plot_path = str(
+            Path(settings.residual_plot_path) / plot_path_suffix
+        )
+
+        try:
+            print("* Obtaining residuals for good prompts...")
+            good_residuals = model.get_residuals_batched(good_prompts)
+            print("* Obtaining residuals for bad prompts...")
+            bad_residuals = model.get_residuals_batched(bad_prompts)
+
+            Analyzer(settings, model, good_residuals, bad_residuals).plot_residuals()
+        finally:
+            settings.residual_plot_path = original_residual_plot_path
+
+    if settings.plot_residuals:
+        print()
+        plot_base_residuals = ask_if_unset(
+            None,
+            questionary.confirm("Plot residuals for the base model now?"),
+        )
+        if plot_base_residuals:
+            plot_residuals("base")
+
     if settings.use_ara:
         print()
         print("Obtaining module I/O for good prompts...")
@@ -733,7 +758,7 @@ def run():
         print()
         print("Calculating per-layer refusal directions...")
 
-        needs_full_residuals = settings.print_residual_geometry or settings.plot_residuals
+        needs_full_residuals = settings.print_residual_geometry
 
         if needs_full_residuals:
             print("* Obtaining residuals for good prompts...")
@@ -748,9 +773,6 @@ def run():
 
             if settings.print_residual_geometry:
                 analyzer.print_residual_geometry()
-
-            if settings.plot_residuals:
-                analyzer.plot_residuals()
 
             # We don't need the full residuals after computing their means and analyzing geometry.
             del good_residuals, bad_residuals, analyzer
@@ -1244,6 +1266,16 @@ def run():
                             *(
                                 [
                                     Choice(
+                                        title="Plot residuals for this trial",
+                                        value="plot_residuals",
+                                    )
+                                ]
+                                if settings.plot_residuals
+                                else []
+                            ),
+                            *(
+                                [
+                                    Choice(
                                         title="Benchmark ARA LoRA approximation ranks",
                                         value="benchmark_ara_lora",
                                     )
@@ -1658,6 +1690,20 @@ def run():
                                         print(
                                             f"[bold]{filename}:[/] [red]File not found[/]"
                                         )
+
+                        case "plot_residuals":
+                            reset_trial_model()
+                            selected_trial_index = trial.user_attrs.get(
+                                "index",
+                                trial.number,
+                            )
+                            plot_residuals(
+                                (
+                                    f"t{selected_trial_index}"
+                                    f"-r{trial.user_attrs['refusals']}"
+                                    f"-kl{trial.user_attrs['kl_divergence']:.4f}"
+                                )
+                            )
 
                         case "chat":
                             print()
