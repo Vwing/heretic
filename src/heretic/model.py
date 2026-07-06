@@ -19,12 +19,14 @@ from torch.utils.hooks import RemovableHandle
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
+    AutoProcessor,
     AutoTokenizer,
     BatchEncoding,
     BitsAndBytesConfig,
     PretrainedConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
+    ProcessorMixin,
     TextStreamer,
 )
 from transformers.generation import (
@@ -32,7 +34,8 @@ from transformers.generation import (
 )
 
 from .config import QuantizationMethod, RowNormalization, Settings
-from .utils import Prompt, batchify, empty_cache, mean_distances_to_knn, print
+from .system import empty_cache
+from .utils import Prompt, batchify, format_exception, mean_distances_to_knn, print
 
 
 def get_model_class(
@@ -74,20 +77,34 @@ ModuleIO: TypeAlias = list[dict[str, dict[int, tuple[Tensor, Tensor]]]]
 class Model:
     model: PreTrainedModel | PeftModel
     tokenizer: PreTrainedTokenizerBase
+    # Set for multimodal models, None for text-only ones.
+    processor: ProcessorMixin | None
     peft_config: LoraConfig
+    dtype: torch.dtype
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.response_prefix = ""
         self.needs_reload = False
+
+        self.revision_kwargs = {}
+        if settings.model_commit is not None:
+            self.revision_kwargs["revision"] = settings.model_commit
 
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             settings.model,
-            trust_remote_code=settings.trust_remote_code,
+            **self.revision_kwargs,
         )
+
+        # Multimodal models have a processor we'll want to save.
+        self.processor = None
+        if get_model_class(settings.model) == AutoModelForImageTextToText:
+            self.processor = AutoProcessor.from_pretrained(
+                settings.model,
+                **self.revision_kwargs,
+            )
 
         # Fallback for tokenizers that don't declare a special pad token.
         if self.tokenizer.pad_token is None:
@@ -104,10 +121,8 @@ class Model:
             if settings.max_memory
             else None
         )
-        self.trusted_models = {settings.model: settings.trust_remote_code}
 
-        if self.settings.evaluate_model is not None:
-            self.trusted_models[settings.evaluate_model] = settings.trust_remote_code
+        self.trusted_models = set()
 
         for dtype in settings.dtypes:
             print(f"* Trying dtype [bold]{dtype}[/]...")
@@ -126,14 +141,19 @@ class Model:
                     dtype=dtype,
                     device_map=settings.device_map,
                     max_memory=self.max_memory,
-                    trust_remote_code=self.trusted_models.get(settings.model),
+                    trust_remote_code=True
+                    if settings.model in self.trusted_models
+                    else None,
+                    **self.revision_kwargs,
                     **extra_kwargs,
                 )
 
+                self.dtype = self.model.dtype
+
                 # If we reach this point and the model requires trust_remote_code,
-                # either the user accepted, or settings.trust_remote_code is True.
-                if self.trusted_models.get(settings.model) is None:
-                    self.trusted_models[settings.model] = True
+                # the user must have agreed when prompted to execute remote code,
+                # because from_pretrained raises an exception otherwise.
+                self.trusted_models.add(settings.model)
 
                 # A test run can reveal dtype-related problems such as the infamous
                 # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
@@ -150,7 +170,13 @@ class Model:
             except Exception as error:
                 self.model = None  # ty:ignore[invalid-assignment]
                 empty_cache()
-                print(f"* [red]Failed[/] ({error})")
+
+                formatted = format_exception(error)
+                if "\n" in formatted:
+                    print(f"* [red]Failed:\n{formatted}[/]")
+                else:
+                    print(f"* [red]Failed ({formatted})[/]")
+
                 continue
 
             if settings.quantization == QuantizationMethod.BNB_4BIT:
@@ -168,13 +194,15 @@ class Model:
         # so we don't need to do anything manually.
 
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
-        print("* Abliterable components:")
+
         all_components = {}
         for layer_index in range(len(self.get_layers())):
             for component, modules in self.get_layer_modules(layer_index).items():
                 if component not in all_components:
                     all_components[component] = 0
                 all_components[component] += len(modules)
+
+        print("* Abliterable components:")
         for component, count in all_components.items():
             print(f"  * [bold]{component}[/]: [bold]{count}[/] modules total")
 
@@ -282,7 +310,10 @@ class Model:
                 self.settings.model,
                 torch_dtype=self.model.dtype,
                 device_map="cpu",
-                trust_remote_code=self.trusted_models.get(self.settings.model),
+                trust_remote_code=True
+                if self.settings.model in self.trusted_models
+                else None,
+                **self.revision_kwargs,
             )
 
             # Apply LoRA adapters to the CPU model
@@ -317,37 +348,44 @@ class Model:
         - Slow path: If switching models or after merge_and_unload(),
           performs full model reload with quantization config.
         """
-        current_model = getattr(self.model.config, "name_or_path", None)
+        # If a prior model load was interrupted/cancelled mid-process, self.model will be None.
+        current_model = None
+        if self.model is not None:
+            current_model = getattr(self.model.config, "name_or_path", None)
+
         if (
             current_model == self.settings.model
             and not self.needs_reload
             and (not self.settings.use_ara or self.settings.use_ara_lora)
         ):
-            # Reset LoRA adapters to zero (identity transformation)
+            # Reset LoRA adapters to zero (identity transformation).
             for name, module in self.model.named_modules():
                 if "lora_B" in name and hasattr(module, "weight"):
                     torch.nn.init.zeros_(module.weight)
             return
 
-        dtype = self.model.dtype
-
         # Purge existing model object from memory to make space.
         self.model = None  # ty:ignore[invalid-assignment]
         empty_cache()
 
-        quantization_config = self._get_quantization_config(str(dtype).split(".")[-1])
+        quantization_config = self._get_quantization_config(
+            str(self.dtype).split(".")[-1]
+        )
 
-        # Build kwargs, only include quantization_config if it's not None
+        # Build kwargs, only include quantization_config if it's not None.
         extra_kwargs = {}
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
         self.model = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
-            dtype=dtype,
+            dtype=self.dtype,
             device_map=self.settings.device_map,
             max_memory=self.max_memory,
-            trust_remote_code=self.trusted_models.get(self.settings.model),
+            trust_remote_code=True
+            if self.settings.model in self.trusted_models
+            else None,
+            **self.revision_kwargs,
             **extra_kwargs,
         )
 
@@ -394,8 +432,8 @@ class Model:
         with suppress(Exception):
             try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
 
-        # Qwen3.5 MoE hybrid layers use GatedDeltaNet (linear attention) instead
-        # of standard self-attention, so self_attn.o_proj doesn't exist on those layers.
+        # Qwen3.5 MoE hybrid layers use GatedDeltaNet (linear attention) instead of
+        # standard self-attention, so self_attn.o_proj doesn't exist on those layers.
         with suppress(Exception):
             try_add("attn.o_proj", layer.linear_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
 
@@ -411,6 +449,21 @@ class Model:
         # Phi-3.5-MoE (and possibly others).
         with suppress(Exception):
             for expert in layer.block_sparse_moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
+                try_add("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
+
+        # LFM dense operator blocks.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.conv.out_proj)  # ty:ignore[possibly-missing-attribute]
+
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.feed_forward.w2)  # ty:ignore[possibly-missing-attribute]
+
+        # LFM transformer blocks.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.self_attn.out_proj)  # ty:ignore[possibly-missing-attribute]
+
+        with suppress(Exception):
+            for expert in layer.feed_forward.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
 
         # Granite MoE Hybrid - attention layers with shared_mlp.
@@ -429,11 +482,13 @@ class Model:
         return modules
 
     def get_abliterable_components(self) -> list[str]:
+        components: set[str] = set()
+
         # Scan all layers because hybrid models (e.g. Qwen3.5 MoE) have different
         # components on different layers (some have self_attn, others linear_attn).
-        components: set[str] = set()
         for layer_index in range(len(self.get_layers())):
             components.update(self.get_layer_modules(layer_index).keys())
+
         return sorted(components)
 
     def abliterate(
@@ -476,6 +531,12 @@ class Model:
                 weight = params.max_weight + (distance / params.min_weight_distance) * (
                     params.min_weight - params.max_weight
                 )
+
+                # A weight of 0 disables this component's ablation. reset_model() has
+                # already left the adapter at identity, so abort before the otherwise
+                # wasteful decomposition (which would also be operating on a zero matrix).
+                if weight == 0:
+                    continue
 
                 if refusal_direction is None:
                     # The index must be shifted by 1 because the first element
@@ -527,9 +588,11 @@ class Model:
                     # Flatten weight matrix to (out_features, in_features).
                     W = W.view(W.shape[0], -1)
 
-                    if self.settings.row_normalization != RowNormalization.NONE:
+                    if self.settings.row_normalization == RowNormalization.FULL:
                         # Keep a reference to the original weight matrix so we can subtract it later.
                         W_org = W
+
+                    if self.settings.row_normalization != RowNormalization.NONE:
                         # Get the row norms.
                         W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
                         # Normalize the weight matrix along the rows.
@@ -558,7 +621,16 @@ class Model:
                         W = W - W_org
                         # Use a low-rank SVD to get an approximation of the matrix.
                         r = self.peft_config.r
+
+                        # svd_lowrank is randomized:
+                        # https://github.com/pytorch/pytorch/blob/20919052303c0b5ba87f8bf7e19237dc33ab09d3/torch/_lowrank.py#L108-L109
+                        # Reseed immediately before the call so restoring a trial is independent of RNG history.
+                        torch.manual_seed(self.settings.seed)
+                        # "It's safe to call this function if CUDA is not available;
+                        # in that case, it is silently ignored."
+                        torch.cuda.manual_seed_all(self.settings.seed)  # ty:ignore[invalid-argument-type]
                         U, S, Vh = torch.svd_lowrank(W, q=2 * r + 4, niter=6)
+
                         # Truncate it to the part we want to store in the LoRA adapter.
                         # Note: svd_lowrank actually returns V, so transpose it to get Vh.
                         U = U[:, :r]
@@ -851,7 +923,7 @@ class Model:
                         # Maintain the original dequantization logic for bitsandbytes.
                         W_base = cast(
                             Tensor,
-                            bnb.functional.dequantize_4bit(
+                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
                                 base_weight.data, quant_state
                             ).to(torch.float32),
                         )
@@ -965,10 +1037,12 @@ class Model:
             ),
         )
 
-        if self.response_prefix:
+        if self.settings.response_prefix:
             # Append the common response prefix to the prompts so that evaluation happens
             # at the point where responses start to differ for different prompts.
-            chat_prompts = [prompt + self.response_prefix for prompt in chat_prompts]
+            chat_prompts = [
+                prompt + self.settings.response_prefix for prompt in chat_prompts
+            ]
 
         inputs = self.tokenizer(
             chat_prompts,
@@ -1030,6 +1104,9 @@ class Model:
             max_new_tokens=1,
             output_hidden_states=True,
             return_dict_in_generate=True,
+            # KV cache is unnecessary here because we only need the hidden states
+            # for the first generated token.
+            use_cache=False,
         )
 
         # This cast is valid because GenerateDecoderOnlyOutput is the return type
@@ -1063,7 +1140,11 @@ class Model:
                 dim=2,
                 keepdim=True,
             )
-            return torch.clamp(residuals, -thresholds, thresholds)
+            residuals = torch.clamp(residuals, -thresholds, thresholds)
+
+        if self.settings.offload_outputs_to_cpu:
+            residuals = residuals.cpu()
+            empty_cache()
 
         return residuals
 
@@ -1201,6 +1282,30 @@ class Model:
 
         return module_io
 
+    def get_residuals_mean(self, prompts: list[Prompt]) -> Tensor:
+        if not prompts:
+            raise ValueError("prompts must not be empty")
+
+        running_sum = None
+        total_count = 0
+
+        for batch in batchify(prompts, self.settings.batch_size):
+            batch_residuals = self.get_residuals(batch)
+
+            # Accumulate in high precision on CPU to reduce peak VRAM usage.
+            batch_sum = batch_residuals.sum(dim=0, dtype=torch.float64).cpu()
+
+            if running_sum is None:
+                running_sum = batch_sum
+            else:
+                running_sum += batch_sum
+
+            total_count += batch_residuals.shape[0]
+
+        assert running_sum is not None
+
+        return (running_sum / total_count).to(torch.float32)
+
     # We work with logprobs rather than probabilities for numerical stability
     # when computing the KL divergence.
     def get_logprobs(self, prompts: list[Prompt]) -> Tensor:
@@ -1209,8 +1314,9 @@ class Model:
         _, outputs = self.generate(
             prompts,
             max_new_tokens=1,
-            output_scores=True,
+            output_logits=True,
             return_dict_in_generate=True,
+            use_cache=False,
         )
 
         # This cast is valid because GenerateDecoderOnlyOutput is the return type
@@ -1218,11 +1324,20 @@ class Model:
         outputs = cast(GenerateDecoderOnlyOutput, outputs)
 
         # Logits for the first (only) generated token.
-        # This cast is valid because we passed output_scores=True above.
-        logits = cast(tuple[FloatTensor], outputs.scores)[0]
+        # Use raw logits, not processed generation scores; processors can insert
+        # -inf for suppressed tokens, which can make KL divergence evaluate to NaN.
+        # This cast is valid because we passed output_logits=True above.
+        logits = cast(tuple[FloatTensor], outputs.logits)[0]
 
         # The returned tensor has shape (prompt, token).
-        return F.log_softmax(logits, dim=-1)
+        logprobs = F.log_softmax(logits, dim=-1)
+
+        if self.settings.offload_outputs_to_cpu:
+            del outputs, logits
+            logprobs = logprobs.cpu()
+            empty_cache()
+
+        return logprobs
 
     def get_logprobs_batched(self, prompts: list[Prompt]) -> Tensor:
         logprobs = []
